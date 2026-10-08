@@ -66,6 +66,8 @@ private:
   uint32_t name_suballocation_ = 0;
   bool owned_by_command_list_ = false;
   bool trimmed_last_ = false;      /* ml685: trim-regret latch */
+  uint64_t fifo_bytes_ = 0;        /* MADEIRA: bytes held by fifo, kept incrementally */
+  uint32_t stats_tick_ = 0;        /* MADEIRA: sample the diagnostic walk */
 };
 
 class DynamicLinearTexture {

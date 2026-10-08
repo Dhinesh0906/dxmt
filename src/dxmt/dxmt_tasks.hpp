@@ -136,8 +136,17 @@ task_scheduler<Task>::submit(Task task) {
   task_queue_.push(task);
 
   if (running.load(std::memory_order_relaxed) == threads && threads < max_threads) {
-    workers_.emplace_back([this]() { worker_func(); });
-    threads++;
+    /* MADEIRA: growing the pool is optional -- the task is already queued for
+     * the existing workers -- so a failed CreateThread (memory pressure) stops
+     * growth instead of throwing out of CreateGraphicsPipeline. */
+    dxmt::thread worker = dxmt::thread::try_spawn([this]() { worker_func(); });
+    if (worker.joinable()) {
+      workers_.push_back(std::move(worker));
+      threads++;
+    } else {
+      WARN("task_scheduler: could not start worker ", threads + 1, "; continuing with ", threads);
+      max_threads = threads;
+    }
   }
 
   worker_cond_.notify_one();

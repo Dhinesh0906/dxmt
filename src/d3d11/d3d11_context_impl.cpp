@@ -1,3 +1,4 @@
+#include <chrono>
 
 /**
 This file is included by d3d11_context_{imm|def}.cpp
@@ -631,6 +632,18 @@ inline void BCStreamReport() {
   static std::atomic<uint32_t> tick{0};
   if ((tick.fetch_add(1, std::memory_order_relaxed) & 0x3FF) != 0)
     return;
+  /* MADEIRA: every 1024 calls scales with texture traffic (59k lines in a 17 min
+   * God of War session); report at most once per 10 s of wall time instead. */
+  {
+    static std::atomic<uint64_t> last_ns{0};
+    uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+    uint64_t prev = last_ns.load(std::memory_order_relaxed);
+    if (prev && now - prev < 10ull * 1000 * 1000 * 1000)
+      return;
+    if (!last_ns.compare_exchange_strong(prev, now, std::memory_order_relaxed))
+      return;
+  }
   static const char *const kName[16] = {"?","BC1","BC2","BC3","BC4u","BC5u","?","BC7",
                                         "?","?","?","?","?","?","BC4s","BC5s"};
   uint32_t total = 0;

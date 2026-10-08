@@ -9,6 +9,7 @@
  */
 
 #pragma once
+#include <new>
 
 #include <chrono>
 #include <condition_variable>
@@ -57,6 +58,20 @@ public:
 
     if (m_handle == nullptr)
       throw MTLD3DError("Failed to create thread");
+  }
+
+  /* MADEIRA: non-throwing creation. Under memory pressure CreateThread can fail
+   * (no room for the stack); callers that can live without the thread use this
+   * instead of an exception, which cannot unwind through the JIT-pool copy of
+   * this DLL on iOS. The thread is created suspended so the reference is taken
+   * only once it exists; on failure joinable() is false. */
+  ThreadFn(Proc &&proc, std::nothrow_t) : m_proc(std::move(proc)) {
+    m_handle = ::CreateThread(nullptr, 0x100000, ThreadFn::threadProc, this,
+                              STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED, nullptr);
+    if (m_handle) {
+      this->incRef();
+      ::ResumeThread(m_handle);
+    }
   }
 
   ~ThreadFn() {
@@ -116,6 +131,13 @@ public:
 
   explicit thread(std::function<void()> &&func)
       : m_thread(new ThreadFn(std::move(func))) {}
+
+  /* MADEIRA: see ThreadFn(Proc&&, std::nothrow_t); check joinable(). */
+  static thread try_spawn(std::function<void()> &&func) {
+    thread t;
+    t.m_thread = new ThreadFn(std::move(func), std::nothrow);
+    return t;
+  }
 
   thread(thread &&other) : m_thread(std::move(other.m_thread)) {}
 

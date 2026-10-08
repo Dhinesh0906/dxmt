@@ -1,8 +1,25 @@
+#include <atomic>
+#include <algorithm>
 #include "dxmt_dynamic.hpp"
 #include "dxmt_texture.hpp"
 #include "dxmt_mem_census.hpp"
+#include "log/log.hpp"
 
 namespace dxmt {
+/* MADEIRA: bytes held by every DynamicBuffer's recycle queue together. The
+ * per-buffer reserve below is generous for small buffers; this bounds the
+ * total so hundreds of busy buffers cannot add up to hundreds of MB. */
+static std::atomic<uint64_t> g_dyn_fifo_bytes{0};
+static constexpr uint64_t DYN_GLOBAL_KEEP_BYTES = 128ull << 20;
+static inline void dyn_fifo_add(uint64_t &mine, uint64_t b) {
+  mine += b;
+  g_dyn_fifo_bytes.fetch_add(b, std::memory_order_relaxed);
+}
+static inline void dyn_fifo_sub(uint64_t &mine, uint64_t b) {
+  b = std::min(mine, b);
+  mine -= b;
+  g_dyn_fifo_bytes.fetch_sub(b, std::memory_order_relaxed);
+}
 DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
     buffer(buffer),
     flags_(flags),
@@ -45,6 +62,7 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
       break;
     }
     ret = std::move(entry.allocation);
+    dyn_fifo_sub(fifo_bytes_, ret.ptr() ? ret->census_bytes_ : 0);
     fifo.pop_front();
     break;
   }
@@ -62,62 +80,79 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
    * The walk and the trim now run for EVERY instance; only the statistics are
    * gated. Behaviour must never depend on diagnostic capacity. */
   {
-    const bool stats = census_id_ < DYN_CENSUS_SLOTS;
-    uint64_t en = 0, eb = 0, in_n = 0, in_b = 0, lo = ~0ull, hi = 0, dup = 0;
-    const void *prev_seen[8] = {nullptr};
-    unsigned pi = 0;
-    for (const auto &e : fifo) {
-      uint64_t bytes = e.allocation.ptr() ? e.allocation->census_bytes_ : 0;
-      if (e.will_free_at <= coherent_seq_id) { en++; eb += bytes; }
-      else                                   { in_n++; in_b += bytes; }
-      if (e.will_free_at < lo) lo = e.will_free_at;
-      if (e.will_free_at > hi) hi = e.will_free_at;
-      for (unsigned k = 0; k < 8; k++)
-        if (prev_seen[k] && prev_seen[k] == (const void *)e.allocation.ptr()) { dup++; break; }
-      prev_seen[pi++ & 7] = (const void *)e.allocation.ptr();
-    }
+    /* MADEIRA: the full walk below only feeds diagnostics; it used to run on
+     * every Map(WRITE_DISCARD) under the lock, O(queue depth) each time. It now
+     * runs on 1 call in 256. */
+    const bool stats = census_id_ < DYN_CENSUS_SLOTS && ((++stats_tick_ & 255) == 0);
     if (stats) {
-      DynStat &st = g_dyn_stats[census_id_];
-      st.depth.store(fifo.size(), std::memory_order_relaxed);
-      st.eligible_n.store(en, std::memory_order_relaxed);
-      st.eligible_bytes.store(eb, std::memory_order_relaxed);
-      st.inelig_n.store(in_n, std::memory_order_relaxed);
-      st.inelig_bytes.store(in_b, std::memory_order_relaxed);
-      st.wfa_min.store(lo == ~0ull ? 0 : lo, std::memory_order_relaxed);
-      st.wfa_max.store(hi, std::memory_order_relaxed);
-      if (dup) st.dup_ptrs.fetch_add(dup, std::memory_order_relaxed);
+      uint64_t en = 0, eb = 0, in_n = 0, in_b = 0, lo = ~0ull, hi = 0, dup = 0;
+      const void *prev_seen[8] = {nullptr};
+      unsigned pi = 0;
+      for (const auto &e : fifo) {
+        uint64_t bytes = e.allocation.ptr() ? e.allocation->census_bytes_ : 0;
+        if (e.will_free_at <= coherent_seq_id) { en++; eb += bytes; }
+        else                                   { in_n++; in_b += bytes; }
+        if (e.will_free_at < lo) lo = e.will_free_at;
+        if (e.will_free_at > hi) hi = e.will_free_at;
+        for (unsigned k = 0; k < 8; k++)
+          if (prev_seen[k] && prev_seen[k] == (const void *)e.allocation.ptr()) { dup++; break; }
+        prev_seen[pi++ & 7] = (const void *)e.allocation.ptr();
+      }
+      if (stats) {
+        DynStat &st = g_dyn_stats[census_id_];
+        st.depth.store(fifo.size(), std::memory_order_relaxed);
+        st.eligible_n.store(en, std::memory_order_relaxed);
+        st.eligible_bytes.store(eb, std::memory_order_relaxed);
+        st.inelig_n.store(in_n, std::memory_order_relaxed);
+        st.inelig_bytes.store(in_b, std::memory_order_relaxed);
+        st.wfa_min.store(lo == ~0ull ? 0 : lo, std::memory_order_relaxed);
+        st.wfa_max.store(hi, std::memory_order_relaxed);
+        if (dup) st.dup_ptrs.fetch_add(dup, std::memory_order_relaxed);
+      }
     }
 
-    /* ml681 SAFE TRIM. Release only entries the GPU has demonstrably finished
-     * with (will_free_at <= coherent_seq_id), and only the surplus beyond a
-     * working reserve. Entries are pushed in non-decreasing will_free_at order,
-     * so the eligible ones are exactly the front run -- stopping at the first
-     * ineligible entry is what makes this safe.
+    /* ml681 SAFE TRIM, MADEIRA rework. Release only entries the GPU has
+     * demonstrably finished with (will_free_at <= coherent_seq_id) -- they form
+     * the front run -- and only the surplus beyond a working reserve.
      *
-     * A blanket depth cap would be a use-after-free: an entry whose
-     * will_free_at still exceeds coherent_seq_id can be in GPU use right now. */
-    enum { DYN_KEEP_ELIGIBLE = 64 };
-    if (en > DYN_KEEP_ELIGIBLE) {
-      uint64_t drop = en - DYN_KEEP_ELIGIBLE, freed = 0, freed_n = 0;
-      while (drop && !fifo.empty()) {
-        const QueueEntry &f = fifo.front();
-        if (f.will_free_at > coherent_seq_id) break;   /* never touch fenced */
-        freed += f.allocation.ptr() ? f.allocation->census_bytes_ : 0;
-        freed_n++;
-        fifo.pop_front();
-        drop--;
-      }
-      if (freed_n) {
-        trimmed_last_ = true;                  /* ml685: for trim-regret */
-        g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
-        g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
-        if (stats) {
-          DynStat &st = g_dyn_stats[census_id_];
-          st.trimmed_n.fetch_add(freed_n, std::memory_order_relaxed);
-          st.trimmed_bytes.fetch_add(freed, std::memory_order_relaxed);
-        }
+     * The reserve was a fixed 64 entries. A buffer mapped hundreds of times per
+     * frame (per-draw constants; God of War: ~3000 draws/frame) then re-minted
+     * every version past the 64th each frame and had the surplus trimmed again
+     * on the next: ~1M fresh allocations and ~1.5M trims per session. Keep up to
+     * DYN_KEEP_MAX entries while the queue holds at most DYN_KEEP_BYTES; large
+     * buffers keep the old 64. */
+    enum { DYN_KEEP_ELIGIBLE = 64, DYN_KEEP_MAX = 2048 };
+    constexpr uint64_t DYN_KEEP_BYTES = 1ull << 20;
+    uint64_t freed = 0, freed_n = 0;
+    while (!fifo.empty() && fifo.front().will_free_at <= coherent_seq_id &&
+           (fifo.size() > DYN_KEEP_MAX ||
+            (fifo.size() > DYN_KEEP_ELIGIBLE &&
+             (fifo_bytes_ > DYN_KEEP_BYTES ||
+              g_dyn_fifo_bytes.load(std::memory_order_relaxed) > DYN_GLOBAL_KEEP_BYTES)))) {
+      const QueueEntry &f = fifo.front();
+      uint64_t bytes = f.allocation.ptr() ? f.allocation->census_bytes_ : 0;
+      freed += bytes;
+      dyn_fifo_sub(fifo_bytes_, bytes);
+      freed_n++;
+      fifo.pop_front();
+    }
+    if (freed_n) {
+      trimmed_last_ = true;                  /* ml685: for trim-regret */
+      g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
+      g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
+      if (census_id_ < DYN_CENSUS_SLOTS) {
+        DynStat &st = g_dyn_stats[census_id_];
+        st.trimmed_n.fetch_add(freed_n, std::memory_order_relaxed);
+        st.trimmed_bytes.fetch_add(freed, std::memory_order_relaxed);
       }
     }
+  }
+
+  {
+    static std::atomic<uint64_t> calls{0};
+    if ((calls.fetch_add(1, std::memory_order_relaxed) & 0x3FFFF) == 0)
+      WARN("[dyn-pool] recycle queues hold ", g_dyn_fifo_bytes.load(std::memory_order_relaxed) >> 20,
+           " MB (global cap ", DYN_GLOBAL_KEEP_BYTES >> 20, " MB)");
   }
 
   /* ml684: report on SEQUENCE ADVANCEMENT, not only on memory high-water marks.
@@ -168,8 +203,10 @@ DynamicBuffer::updateImmediateName(uint64_t current_seq_id, Rc<BufferAllocation>
   g_mem_census.dyn_seq_current.store(current_seq_id, std::memory_order_relaxed);   /* ml680 */
   if (!owned_by_command_list_ && census_id_ < DYN_CENSUS_SLOTS)
     g_dyn_stats[census_id_].push_update.fetch_add(1, std::memory_order_relaxed);   /* ml681 */
-  if (!owned_by_command_list_)
+  if (!owned_by_command_list_) {
+    dyn_fifo_add(fifo_bytes_, name_.ptr() ? name_->census_bytes_ : 0);
     fifo.push_back(QueueEntry{.allocation = std::move(name_), .will_free_at = current_seq_id});
+  }
   name_ = std::move(allocation);
   name_suballocation_ = suballocation;
   owned_by_command_list_ = owned_by_command_list;
@@ -187,6 +224,7 @@ DynamicBuffer::recycle(uint64_t current_seq_id, Rc<BufferAllocation> &&allocatio
   }
   if (census_id_ < DYN_CENSUS_SLOTS)
     g_dyn_stats[census_id_].push_recycle.fetch_add(1, std::memory_order_relaxed);   /* ml681 */
+  dyn_fifo_add(fifo_bytes_, allocation.ptr() ? allocation->census_bytes_ : 0);
   fifo.push_back(QueueEntry{.allocation = std::move(allocation), .will_free_at = current_seq_id});
 }
 

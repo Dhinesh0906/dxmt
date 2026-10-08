@@ -214,6 +214,7 @@ const GUID kGpaUUID = {0xccffef16,
                        0x468f,
                        {0xbc, 0xe3, 0xcd, 0x95, 0x33, 0x69, 0xa3, 0x9a}};
 
+
 class MTLD3D11DeviceImpl final : public MTLD3D11Device, public IMTLD3D11DeviceExt {
 friend class MTLD3D11DXGIDevice;
 public:
@@ -255,24 +256,57 @@ public:
                ID3D11Buffer **ppBuffer) override {
     InitReturnPtr(ppBuffer);
 
-    if (pDesc->ByteWidth == 0 && !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL))
-      return E_INVALIDARG; 
+    // MADEIRA: native D3D11 rejects ByteWidth == 0 with E_INVALIDARG, and some games
+    // treat that as fatal. CrossOver's D3DMetal accepts it, and games ship assets that
+    // rely on that (God of War: an index buffer with zero indices). Back a zero-width
+    // request with a tiny zero-filled buffer instead: nothing can be drawn from it,
+    // which is exactly what an empty buffer means.
+    D3D11_BUFFER_DESC madeira_desc;
+    D3D11_SUBRESOURCE_DATA madeira_init;
+    alignas(16) static const uint8_t madeira_zero[2048] = {}; // D3D11 max structure stride
+    if (pDesc->ByteWidth == 0 && !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL)) {
+      static uint32_t warned = 0;
+      if (warned++ < 8)
+        WARN("CreateBuffer: ByteWidth=0 (Usage=", pDesc->Usage, " BindFlags=", pDesc->BindFlags,
+             " Stride=", pDesc->StructureByteStride, "), creating an empty placeholder buffer");
+      madeira_desc = *pDesc;
+      // 16 bytes satisfies every bind type (constant buffers need a multiple of 16);
+      // a structured buffer needs exactly one element.
+      madeira_desc.ByteWidth = 16;
+      if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && pDesc->StructureByteStride &&
+          pDesc->StructureByteStride <= sizeof(madeira_zero))
+        madeira_desc.ByteWidth = pDesc->StructureByteStride;
+      pDesc = &madeira_desc;
+      if (pInitialData) {
+        madeira_init = *pInitialData;
+        madeira_init.pSysMem = madeira_zero;
+        pInitialData = &madeira_init;
+      }
+    }
 
+    HRESULT madeira_hr = E_FAIL;
     try {
       switch (pDesc->Usage) {
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:
       case D3D11_USAGE_DYNAMIC:
-        return dxmt::CreateBuffer(this, pDesc, pInitialData, ppBuffer);
+        madeira_hr = dxmt::CreateBuffer(this, pDesc, pInitialData, ppBuffer);
+        break;
       case D3D11_USAGE_STAGING:
-        return CreateStagingBuffer(this, pDesc, pInitialData, ppBuffer);
+        madeira_hr = CreateStagingBuffer(this, pDesc, pInitialData, ppBuffer);
+        break;
       default:
         DXMT_UNREACHABLE
       }
     } catch (const MTLD3DError &err) {
       ERR(err.message());
-      return E_FAIL;
+      madeira_hr = E_FAIL;
     }
+    if (FAILED(madeira_hr))
+      ERR("CreateBuffer failed hr=", madeira_hr, " ByteWidth=", pDesc->ByteWidth, " Usage=", pDesc->Usage,
+          " BindFlags=", pDesc->BindFlags, " CPUAccess=", pDesc->CPUAccessFlags, " Misc=", pDesc->MiscFlags,
+          " Stride=", pDesc->StructureByteStride, " initialData=", pInitialData != nullptr);
+    return madeira_hr;
   }
 
   HRESULT STDMETHODCALLTYPE
